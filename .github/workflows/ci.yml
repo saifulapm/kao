@@ -1,0 +1,97 @@
+name: CI
+
+# Runs strict byte-compile + the full ERT suite across the supported Emacs matrix
+# (29.1 / 30.1 / snapshot) — the real version-compatibility signal.  Checkdoc is
+# run ONCE on the snapshot build, not per-version: its imperative-mood and
+# line-width heuristics differ across Emacs releases, so a per-matrix checkdoc
+# gate is unstable (a docstring clean on 31 trips 30.1).  Tree-sitter grammars are
+# installed at pinned revisions so the kao-treesit tests actually run instead of
+# skipping.  `make bench` is deliberately NOT a CI gate — its numbers are
+# machine-relative and would be flaky on shared runners.
+
+on:
+  push:
+    tags: ['v*']
+  pull_request:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  check:
+    name: Emacs ${{ matrix.emacs_version }}
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        # 30.x pinned to 30.1; bump here (or to `release`) if a newer 30 ships.
+        emacs_version: ['29.1', '30.1', 'snapshot']
+    steps:
+      - name: Check out
+        uses: actions/checkout@v5
+
+      - name: Install Emacs ${{ matrix.emacs_version }}
+        uses: purcell/setup-emacs@master
+        with:
+          version: ${{ matrix.emacs_version }}
+
+      # Pinned grammar revisions chosen in the ABI-14 era so they load on Emacs
+      # 29.1 as well as 30/snapshot.  Guarded by `treesit-available-p`: a build
+      # without tree-sitter provisions nothing and the coverage assertion below
+      # is skipped for that job.  Revisions may need bumping per Emacs version;
+      # the first real run validates them.
+      - name: Install tree-sitter grammars (pinned)
+        id: grammars
+        run: |
+          if emacs -Q --batch --eval '(kill-emacs (if (and (fboundp (quote treesit-available-p)) (treesit-available-p)) 0 1))'; then
+            emacs -Q --batch --eval '(progn
+              (require (quote treesit))
+              (setq treesit-language-source-alist
+                    (quote ((bash "https://github.com/tree-sitter/tree-sitter-bash" "v0.21.0")
+                            (javascript "https://github.com/tree-sitter/tree-sitter-javascript" "v0.21.4")
+                            (html "https://github.com/tree-sitter/tree-sitter-html" "v0.20.4")
+                            (json "https://github.com/tree-sitter/tree-sitter-json" "v0.21.0")
+                            (yaml "https://github.com/ikatyang/tree-sitter-yaml" "v0.5.0"))))
+              (dolist (lang (quote (bash javascript html json yaml)))
+                (message "Installing %s grammar..." lang)
+                (treesit-install-language-grammar lang)))'
+            echo "provisioned=yes" >> "$GITHUB_OUTPUT"
+          else
+            echo "tree-sitter unavailable in this Emacs build; skipping grammar install"
+            echo "provisioned=no" >> "$GITHUB_OUTPUT"
+          fi
+
+      - name: Run gate (compile + test) and assert treesit coverage
+        run: |
+          set -o pipefail
+          make compile compile-tests test 2>&1 | tee ert.log
+          if [ "${{ steps.grammars.outputs.provisioned }}" = "yes" ]; then
+            # Assert the C-scanner grammars kao relies on actually LOADED — a silent ABI
+            # mismatch would leave a provisioned grammar unavailable.  Check that intent
+            # DIRECTLY rather than inferring it from ERT skip counts, which are noisy:
+            # tests also skip for non-grammar reasons — yaml (a C++ scanner the Nix
+            # snapshot Emacs can't load) and the Emacs-31+ GROUPED query path.  bash/
+            # javascript/html are the reliable C-scanner core; json/yaml stay best-effort.
+            for lang in bash javascript html; do
+              if ! emacs -Q --batch --eval "(require 'treesit)" \
+                     --eval "(kill-emacs (if (treesit-language-available-p '$lang) 0 1))"; then
+                echo "::error::provisioned grammar $lang failed to load (ABI mismatch for this Emacs?)"
+                exit 1
+              fi
+            done
+            passed=$(grep -cE "^[[:space:]]+passed[[:space:]].*kao-treesit" ert.log || true)
+            echo "treesit coverage: bash/javascript/html loaded; kao-treesit passed=$passed"
+            if [ "$passed" -eq 0 ]; then
+              echo "::error::grammars were provisioned but no kao-treesit test ran"
+              exit 1
+            fi
+          else
+            echo "tree-sitter unavailable; skipping the treesit-coverage assertion"
+          fi
+
+      # Checkdoc's diagnostics are Emacs-version-dependent, so run it ONCE on the
+      # newest (snapshot) build rather than gating every matrix job on it.
+      - name: Checkdoc (once, on snapshot)
+        if: matrix.emacs_version == 'snapshot'
+        run: make checkdoc
